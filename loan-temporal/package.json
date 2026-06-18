@@ -1,0 +1,28 @@
+{
+  "name": "loan-disbursement-temporal",
+  "version": "1.0.0",
+  "description": "Temporal-orchestrated loan disbursement reference architecture",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit",
+    "worker": "ts-node src/worker.ts",
+    "demo": "ts-node src/demo.ts",
+    "register-sa": "ts-node src/scripts/registerSearchAttributes.ts"
+  },
+  "dependencies": {
+    "@temporalio/activity": "^1.12.0",
+    "@temporalio/client": "^1.12.0",
+    "@temporalio/common": "^1.12.0",
+    "@temporalio/testing": "^1.16.2",
+    "@temporalio/worker": "^1.12.0",
+    "@temporalio/workflow": "^1.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  },
+  "overrides": {
+    "protobufjs": "^7.6.3"
+  }
+}
