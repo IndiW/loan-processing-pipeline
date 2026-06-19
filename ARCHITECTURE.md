@@ -305,6 +305,59 @@ A review-SLA timer (4h) wakes the workflow to flag stale reviews (it flips the
 `AssignedReviewer` SA to `ESCALATED` and writes an audit event) without
 abandoning the wait.
 
+### 8.1 Notifications — what fires today vs. what production needs
+
+Notifications are deliberately scoped narrow in this cut. The workflow knows
+*when* a human or applicant should be told something; it does **not** own the
+outbound channel (Slack, email, SMS, PagerDuty). That boundary keeps the
+workflow stable while channels change.
+
+**Applicant notifications** fire via the `notifyApplicant` activity at every
+state the applicant needs to know about:
+
+| Trigger | Template |
+| --- | --- |
+| Validation found missing documents | `MISSING_DOCS` |
+| Human reviewer requested more documents | `MISSING_DOCS` (with `requestedDocuments`) |
+| Funded | `APPROVED` |
+| Declined (any path) | `DECLINED` |
+| Applicant withdrew | `WITHDRAWN` |
+
+**Reviewer notifications** are the gap. The workflow does **two** things when
+an application lands in `PENDING_HUMAN_REVIEW`:
+
+1. Calls `createReviewTask` (an activity that is intended to write a row to a
+   `ReviewTasks` table the ops dashboard reads). Today this is a log-line stub.
+2. Upserts the `ApplicationStatus` Search Attribute to `PENDING_HUMAN_REVIEW`,
+   so the Temporal UI / a custom dashboard can filter for waiting work.
+
+There is **no push** to a reviewer — no Slack ping, no email, no SMS. Today
+the model is pull-only: reviewers query a worklist (when one exists) or filter
+the Temporal UI by Search Attribute. The 4h review-SLA flips the
+`AssignedReviewer` SA to `ESCALATED` for an "escalations" dashboard, but
+that's still pull-based; it doesn't poke an on-call channel.
+
+**Two gaps worth tracking, both low-effort fixes:**
+
+1. **Applicant is not notified on `EXPIRED`.** Every other terminal path
+   (`APPROVED`, `DECLINED`, `WITHDRAWN`) calls `notifyApplicant`; the 48h SLA
+   path silently transitions to `EXPIRED` and emits the outcome to billing
+   without telling the applicant. For a regulated bank this is bad UX and
+   likely a compliance trip-wire. Fix is a single `notifyApplicant` call in
+   `enforceSla` plus an `EXPIRED` entry in the `notifyApplicant` template
+   union.
+2. **Reviewers must opt in to a dashboard to see work.** Production needs a
+   `notifyReviewer` activity called at the same point as `createReviewTask`,
+   and again on the 4h escalation path. It should be idempotent on
+   `applicationId + eventType` so a duplicate doesn't spam a Slack channel.
+   The activity itself is a thin wrapper over your ops notification provider;
+   the workflow-side wiring is two call sites.
+
+The reason both gaps are easy is that the workflow's *control flow* is
+already in the right shape — it knows the exact moments at which a human
+needs to act and an applicant needs an update. Hooking real channels into
+those moments is adding an activity and a call site, not a redesign.
+
 ---
 
 ## 9. Product isolation
