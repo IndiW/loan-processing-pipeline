@@ -227,15 +227,18 @@ worker pods to 1 or 50, the bureau still sees ≤ N rps. No token bucket to buil
 `Promise.all([... .catch(() => null)])`, so a provider that exhausts its retries
 yields `null` rather than failing the application. Underwriting then decides
 whether a missing signal is **fatal** (decline) or **referable** (a human can
-proceed with degraded data). Example from the personal ruleset:
+proceed with degraded data). The guiding rule: **never auto-approve while a
+required signal is missing.** A bank that approves loans during a fraud-vendor
+outage is making the wrong default. Example from the personal ruleset:
 
 ```text
-no credit report      → REFER (human can pull manually)
-identity unverified   → REFER
-credit < 620          → DECLINE
-fraud risk ≥ 80       → DECLINE
-delinquency / >40k    → REFER
-otherwise             → APPROVE
+no credit report          → REFER (human can pull manually)
+identity unverified       → REFER
+fraud screening missing   → REFER (vendor down — never auto-approve blind)
+credit < 620              → DECLINE
+fraud risk ≥ 80           → DECLINE
+delinquency / >40k        → REFER
+otherwise                 → APPROVE
 ```
 
 ```mermaid
@@ -244,7 +247,9 @@ flowchart LR
     C -- no --> R[REFER to human]
     C -- yes --> I{identity ok?}
     I -- no --> R
-    I -- yes --> F{fraud / score / amount}
+    I -- yes --> FA{fraud signal<br/>available?}
+    FA -- no --> R
+    FA -- yes --> F{fraud / score / amount}
     F -- decline rule --> D[DECLINE]
     F -- borderline --> R
     F -- clean --> AP[APPROVE]

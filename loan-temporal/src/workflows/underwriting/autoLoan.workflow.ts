@@ -20,9 +20,14 @@ export async function autoLoanUnderwriting(input: UnderwritingInput): Promise<Un
   if (!hasTitle) {
     return { decision: 'REFER', reasons: ['vehicle_title_missing'], rulesetVersion: RULESET_VERSION };
   }
+  // Same principle as personal: never auto-approve when the fraud provider
+  // exhausted its retries. The human can pull the screen manually.
+  if (!enrichment.fraud) {
+    return { decision: 'REFER', reasons: ['fraud_screening_unavailable'], rulesetVersion: RULESET_VERSION };
+  }
 
   const { credit, fraud } = enrichment;
-  if (fraud && fraud.riskScore >= 70) {
+  if (fraud.riskScore >= 70) {
     reasons.push('high_fraud_risk');
     return { decision: 'DECLINE', reasons, rulesetVersion: RULESET_VERSION };
   }

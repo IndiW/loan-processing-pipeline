@@ -299,6 +299,39 @@ describe('AWAITING_DOCUMENTS path', () => {
   });
 });
 
+// ── Enrichment partial failure ─────────────────────────────────────────────
+
+describe('Enrichment partial failure → REFER, never silent approve', () => {
+  it('refers to human when the fraud provider exhausts retries', async () => {
+    // Simulate the provider being permanently down. We throw a non-retryable
+    // ApplicationFailure so the activity short-circuits instead of running
+    // through all 8 retries (~4 min of backoff) — the workflow's
+    // .catch(() => null) still yields a null fraud bundle either way.
+    // The application MUST NOT auto-approve without a fraud signal.
+    const { ApplicationFailure } = await import('@temporalio/common');
+    currentMocks.screenForFraud = jest.fn(async () => {
+      throw ApplicationFailure.create({
+        message: 'FraudProvider permanently down',
+        type: 'ProviderDown',
+        nonRetryable: true,
+      });
+    });
+
+    const handle = await startWorkflow(app('fraud-down-1'));
+    await waitForStatus(handle, 'PENDING_HUMAN_REVIEW');
+
+    const st = await handle.query(getState);
+    expect(st.reasons).toContain('fraud_screening_unavailable');
+
+    // Clean up so the workflow terminates.
+    await handle.executeUpdate(submitHumanDecision, {
+      args: [{ type: 'APPROVE', reviewerId: 'rev-1', notes: 'manual fraud check OK', approvedAmount: 15_000, interestRate: 0.069 }],
+    });
+    const result = await handle.result();
+    expect(result.status).toBe('FUNDED');
+  }, 60_000);
+});
+
 // ── DECLINED via underwriting ──────────────────────────────────────────────
 
 describe('DECLINED path — underwriting hard decline', () => {

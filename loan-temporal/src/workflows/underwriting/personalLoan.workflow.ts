@@ -42,10 +42,20 @@ export async function personalLoanUnderwriting(
       rulesetVersion: RULESET_VERSION,
     };
   }
+  // Approving a loan while the fraud signal is unavailable is the wrong
+  // default for a regulated lender; treat a null result (provider down,
+  // retries exhausted) the same as missing credit/identity → REFER.
+  if (!enrichment.fraud) {
+    return {
+      decision: 'REFER',
+      reasons: ['fraud_screening_unavailable'],
+      rulesetVersion: RULESET_VERSION,
+    };
+  }
 
   const { credit, fraud } = enrichment;
 
-  if (fraud && fraud.riskScore >= 80) {
+  if (fraud.riskScore >= 80) {
     reasons.push('high_fraud_risk');
     return { decision: 'DECLINE', reasons, rulesetVersion: RULESET_VERSION };
   }

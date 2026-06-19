@@ -89,6 +89,13 @@ describe('personalLoanUnderwriting', () => {
     expect(result.reasons).toContain('identity_unverified');
   });
 
+  it('refers when the fraud provider is unavailable (null fraud)', async () => {
+    const enrichment: EnrichmentBundle = { ...goodEnrichment, fraud: null };
+    const result = await personalLoanUnderwriting({ application: baseApp, enrichment });
+    expect(result.decision).toBe('REFER');
+    expect(result.reasons).toContain('fraud_screening_unavailable');
+  });
+
   it('refers when there are delinquencies on credit report', async () => {
     const enrichment: EnrichmentBundle = {
       ...goodEnrichment,
@@ -182,6 +189,13 @@ describe('autoLoanUnderwriting', () => {
     const result = await autoLoanUnderwriting({ application: noTitle, enrichment: goodEnrichment });
     expect(result.decision).toBe('REFER');
     expect(result.reasons).toContain('vehicle_title_missing');
+  });
+
+  it('refers when the fraud provider is unavailable (null fraud)', async () => {
+    const enrichment: EnrichmentBundle = { ...goodEnrichment, fraud: null };
+    const result = await autoLoanUnderwriting({ application: autoApp, enrichment });
+    expect(result.decision).toBe('REFER');
+    expect(result.reasons).toContain('fraud_screening_unavailable');
   });
 
   it('refers when amount exceeds $60,000', async () => {
