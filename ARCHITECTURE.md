@@ -435,4 +435,408 @@ events stays small, so `continue-as-new` isn't needed here.
   front end).
 - Per-environment **Temporal Schedule** definitions for the aggregator fan-out.
 
+---
+
+## Appendix A. The same system, built with conventional AWS primitives
+
+Before reaching for Temporal, it's worth showing what this system would look
+like as a standard event-driven AWS stack — SQS, Lambda, DynamoDB, S3, SES,
+EventBridge. Same business problem, same state machine, no orchestrator. This
+is the build a competent serverless team would ship without Temporal in their
+toolkit; understanding it makes the Temporal version (Appendix B) earn its
+keep.
+
+### A.1 Architecture
+
+```mermaid
+flowchart TB
+    subgraph Ingestion["Ingestion"]
+        APIGW[API Gateway<br/>POST /applications]
+        SES[SES inbound<br/>+ S3 raw bucket]
+        EVB[EventBridge<br/>Scheduler<br/>hourly]
+    end
+
+    APIGW --> ING[Lambda: StartApplication]
+    SES --> PARSE[Lambda: ParseBrokerEmail]
+    EVB --> FANOUT[Lambda: AggregatorFanOut<br/>+ Step Functions]
+
+    ING --> APPS[(DynamoDB<br/>Applications)]
+    PARSE --> APPS
+    FANOUT --> APPS
+
+    ING --> Q1[SQS: validate-q]
+    PARSE --> Q1
+    FANOUT --> Q1
+
+    Q1 --> VAL[Lambda: Validate]
+    VAL --> APPS
+    VAL -->|ok| Q2[SQS: enrich-q]
+    VAL -->|missing docs| AWAIT[Awaiting docs<br/>state in DynamoDB<br/>+ EventBridge timer]
+
+    Q2 --> COORD[Lambda: EnrichCoordinator<br/>writes 3 sub-msgs]
+    COORD --> QC[SQS FIFO: credit-q<br/>concurrency=10]
+    COORD --> QI[SQS FIFO: identity-q<br/>concurrency=5]
+    COORD --> QF[SQS FIFO: fraud-q<br/>concurrency=15]
+
+    QC --> LC[Lambda: PullCredit] --> CB[(Credit bureau)]
+    QI --> LI[Lambda: VerifyIdentity] --> IDV[(Identity vendor)]
+    QF --> LF[Lambda: ScreenFraud] --> FRD[(Fraud vendor)]
+
+    LC --> APPS
+    LI --> APPS
+    LF --> APPS
+
+    APPS -->|Streams| JOIN[Lambda: EnrichJoin<br/>fires when all 3 results present]
+    JOIN --> Q3[SQS: underwrite-q]
+
+    Q3 --> UW[Lambda: Underwrite<br/>switch on product]
+    UW -->|APPROVE| Q4[SQS: fund-q]
+    UW -->|DECLINE| Q5[SQS: notify-q]
+    UW -->|REFER| HRQ[Review tasks table<br/>+ EventBridge SLA timer]
+
+    Q4 --> DISB[Lambda: Disburse] --> PAY[(Payment rail)]
+    DISB --> Q5
+    Q5 --> NOTIFY[Lambda: NotifyApplicant] --> SNS[SNS / SES]
+
+    subgraph Ops["Ops"]
+        UI[Review dashboard]
+        REVAPI[API Gateway<br/>POST /decisions]
+    end
+    UI --> APPS
+    UI --> RTBL[(DynamoDB<br/>ReviewTasks)]
+    REVAPI --> HRL[Lambda: SubmitDecision] --> APPS
+    HRL --> Q3
+
+    APPS -->|Streams| AUD[Lambda: AuditWriter]
+    AUD --> AUDTBL[(DynamoDB<br/>AuditLog append-only)]
+    APPS -->|Streams| OS[OpenSearch<br/>read model for ops]
+    UI --> OS
+```
+
+### A.2 The state machine, now externalised
+
+The business state machine in §3 is unchanged — applications still pass
+through `INGESTED → VALIDATING → ENRICHING → UNDERWRITING → FUNDING → FUNDED`
+with the same `AWAITING_DOCUMENTS` / `PENDING_HUMAN_REVIEW` branches. What
+changes is **where the state lives and who advances it**.
+
+In this design, *no single process* owns an application's progress. State
+lives in DynamoDB; transitions are an OCC dance:
+
+```text
+1. Lambda reads Applications#<appId>     (returns status + version)
+2. Lambda does its work                   (calls a vendor, applies rules, …)
+3. Lambda issues:
+     UpdateItem
+       Key:                {applicationId}
+       UpdateExpression:   SET status=:new, version=version+1, ...
+       ConditionExpression: status = :expected AND version = :v
+4. On success → publish next-stage SQS message
+   On ConditionalCheckFailed → another worker already advanced it; drop
+```
+
+Every transition is one of these conditional updates. The state machine isn't
+a diagram any more — it's a constraint enforced by `ConditionExpression` on
+every UpdateItem call, replicated across ~10 Lambda handlers.
+
+### A.3 Storage layout
+
+| Store | Purpose | Notes |
+| --- | --- | --- |
+| **DynamoDB `Applications`** | Authoritative state row per `applicationId` | Includes `status`, `product`, `channel`, `version`, embedded enrichment results, current `slaDeadline` epoch, `assignedReviewer` |
+| **DynamoDB `AuditLog`** | Append-only audit; PK=`applicationId`, SK=`ts#evtId` | Written by every state-changing Lambda **and** by a Streams-fed audit writer (belt-and-braces — see A.6) |
+| **DynamoDB `ReviewTasks`** | Reviewer worklist; PK=`reviewerId`, GSI on `status` | Written when status → PENDING_HUMAN_REVIEW; deleted on decision |
+| **DynamoDB `IdempotencyKeys`** | Per-SQS-message dedupe | Required because every Lambda is at-least-once |
+| **DynamoDB `SlaTimers`** (or EventBridge Scheduler) | `applicationId → fire-at` | Polled by a sweeper Lambda *or* one-shot EventBridge Scheduler entries |
+| **S3 `loan-documents`** | ID, proof of income, vehicle title, bank statements | SSE-KMS; presigned URLs to the portal/broker |
+| **S3 `aggregator-batch`** | Raw daily extracts before fan-out | Versioning on; the Step Functions fan-out reads from a specific object version |
+| **OpenSearch** (or Aurora) | Ops read model | Fed by DynamoDB Streams; what the dashboard actually queries |
+
+Note: the `Applications` row is the source of truth, but **five other stores
+exist solely to compensate for things the row can't do** — audit replay,
+operator search, reviewer worklists, timers, idempotency. None of them is
+free; each has a separate retention/backup/migration story.
+
+### A.4 Per-stage processing (the choreography)
+
+Each box on the diagram is its own Lambda with its own retry policy, its own
+IAM role, its own deployment, and its own idempotency check. A representative
+handler (the underwriting Lambda) does:
+
+```text
+1. Receive SQS message {applicationId}
+2. Idempotency: PutItem(IdempotencyKeys, key=messageId, condition=attribute_not_exists)
+                → if it exists, ACK and return (already processed)
+3. GetItem(Applications, applicationId)
+4. Assert status == 'ENRICHING' (else log and ACK — out of order)
+5. Apply product ruleset → decision
+6. UpdateItem with ConditionExpression status='ENRICHING' AND version=:v
+     SET status='UNDERWRITING' or 'PENDING_HUMAN_REVIEW' or 'FUNDING' or 'DECLINED'
+7. PutItem(AuditLog, ...)
+8. Branch on decision:
+     APPROVE → SendMessage(fund-q)
+     DECLINE → SendMessage(notify-q, template=DECLINED)
+     REFER   → PutItem(ReviewTasks); SendMessage(start-review-sla-timer)
+9. DeleteMessage from SQS
+```
+
+That's ~50 lines of plumbing per stage before any business logic. Eight
+stages, eight Lambdas, ~400 lines of nearly-identical glue. Get one of those
+`ConditionExpression`s wrong (e.g. forget the `version` clause) and the system
+silently double-processes during retries.
+
+### A.5 SLA timers — the part everyone underestimates
+
+Three independent timer requirements: 48-hour overall SLA, 24-hour
+`AWAITING_DOCUMENTS` wait, 4-hour human-review SLA. Each must survive Lambda
+restarts and worker redeploys. Realistic options:
+
+| Approach | Mechanics | Pain |
+| --- | --- | --- |
+| **EventBridge Scheduler (one-shot per timer)** | At app start, create `app-<id>-sla` schedule firing at `now+48h` to invoke `SlaExpiryLambda`. On terminal state, delete the schedule. | Hundreds of thousands of schedules. Quotas and listing become operational concerns. Forgotten cleanups on terminal paths leak resources. |
+| **DynamoDB TTL + Streams** | Set `ttl = epoch+48h` on the row; TTL deletion triggers Streams. | TTL fires within ~48 *hours* of the timestamp — not a precision instrument. Plus it deletes the row, which you don't actually want. So you maintain a separate `SlaTimers` table whose rows you delete-on-terminal. |
+| **Step Functions Wait state** | Wrap each app in a Step Functions execution with a `Wait` state. | You've now reinvented a workflow engine. Step Functions has a 1-year execution limit and explicit state-language plumbing — fine for this case but the rest of the design no longer makes sense without it. |
+| **Sweeper Lambda on schedule** | Every minute, scan `SlaTimers` `WHERE fire_at <= now`. | Polling overhead + the sweep itself must be highly available + the table grows unboundedly without compaction. |
+
+In practice teams pick EventBridge Scheduler and accept the operational
+surface area. None of these options is one line of code.
+
+### A.6 Human-in-the-loop — the harder part
+
+The flow that's one `await condition(...)` in the Temporal version:
+
+```mermaid
+sequenceDiagram
+    participant UW as Underwrite Lambda
+    participant APPS as Applications (DynamoDB)
+    participant RTBL as ReviewTasks (DynamoDB)
+    participant SCHED as EventBridge<br/>Scheduler
+    participant OS as OpenSearch
+    participant UI as Review dashboard
+    participant API as POST /decisions
+    participant HRL as SubmitDecision Lambda
+
+    UW->>APPS: UpdateItem status=PENDING_HUMAN_REVIEW (CAS on version)
+    UW->>RTBL: PutItem reviewerId=null, reasons=[...]
+    UW->>SCHED: Create one-shot "review-sla-<appId>" at now+4h
+    APPS-->>OS: Stream → project status change
+    UI->>OS: List worklist
+    UI->>API: POST decision {APPROVE, $80k, 8%}
+    API->>HRL: invoke
+    HRL->>APPS: GetItem (need current version)
+    HRL->>HRL: Validate: status==PENDING_HUMAN_REVIEW<br/>amount <= reviewer.authority
+    alt invalid
+        HRL-->>API: 409 / 403
+    else valid
+        HRL->>APPS: UpdateItem status=FUNDING (CAS on version)
+        HRL->>RTBL: DeleteItem
+        HRL->>SCHED: DeleteSchedule review-sla-<appId>
+        HRL->>+UW: SendMessage(fund-q, {applicationId})
+        HRL-->>API: 200
+    end
+```
+
+Things that have to be true for this to work — none of them automatic:
+
+1. **`SubmitDecision` validation is its own service.** Reviewer authority,
+   state check, idempotency, and the decision-to-next-queue mapping all live
+   in one Lambda. A second Lambda for the SLA timer duplicates two of those.
+2. **Concurrent decisions race.** Two reviewers approving at the same time
+   both pass the GetItem precheck. The CAS on `version` in UpdateItem makes
+   one of them fail with ConditionalCheckFailed, which the Lambda has to
+   translate into a 409 response. Without that translation you serve a 500.
+3. **Timer cleanup is the bug source.** Forgetting to `DeleteSchedule` on
+   the happy path means an `SlaExpiryLambda` fires hours later on an
+   already-funded application; it must defensively re-check state, which
+   means every terminal Lambda needs to know about every timer.
+4. **Resume after a deploy is implicit.** "Pick up exactly where it left off"
+   is true only because the row in DynamoDB carries every byte of state the
+   next Lambda needs to read. Anything held in process memory — a partial
+   enrichment result not yet persisted — is lost on Lambda restart. So every
+   intermediate computation is a DynamoDB write.
+
+### A.7 Partial failure across providers
+
+The enrichment fan-out has no native "wait for all three" primitive in the
+SQS/Lambda world. Three production patterns, none free:
+
+- **Step Functions Parallel.** Drop into Step Functions for just the
+  enrichment subgraph. Each branch is a Lambda. Step Functions handles the
+  join. You now run two orchestration models in one system; the `catch` on
+  each branch must distinguish *retryable* from *permanent* failure and emit
+  a `null` result rather than failing the parallel state.
+- **DynamoDB Streams join.** Each provider Lambda writes its result to an
+  attribute on the `Applications` row; a Streams-triggered `EnrichJoin`
+  Lambda fires on every update and checks `if (credit && identity && fraud) →
+  publish next-stage`. The join Lambda runs for every change to every
+  application, which is N×3 invocations to do one logical thing.
+- **Counter row.** Maintain a `pending = 3` counter; each provider decrements
+  it atomically; the one that hits zero publishes. Simple, but you can't
+  distinguish "provider responded null" from "provider never responded" —
+  you need a separate result column, which brings you back to option 2.
+
+Rate limits per provider are handled at the Lambda concurrency level
+(`reserved-concurrency` per function), which is global across all callers.
+SQS FIFO with throughput-per-message-group gives finer control but caps
+single-group throughput at 300 msg/s.
+
+### A.8 Observability
+
+| Need | Mechanism |
+| --- | --- |
+| "Where is application X?" | `GetItem(Applications, X)` — one strong read |
+| "All AUTO apps stuck in review >2h" | OpenSearch query against the projected read model |
+| Stuck applications | A sweeper Lambda + custom CloudWatch metric on `count(status NOT IN terminal AND now-updatedAt > threshold)` |
+| Failing providers | Per-Lambda DLQ depth, per-Lambda Errors metric, per-provider-queue ApproximateAgeOfOldestMessage |
+| Why did this decision happen? | Replay from `AuditLog` (read events in order, reapply mentally) |
+| End-to-end trace | Each Lambda adds an X-Ray segment; one trace covers the whole app *only if* trace IDs are propagated through every SQS message header |
+
+The audit log is your only "what actually ran" record. There's no replay.
+Reconstruction is the auditor's problem.
+
+### A.9 What this design is actually paying for
+
+A non-exhaustive list of the implicit costs:
+
+- ~10 Lambda functions, each with its own deploy/IAM/observability story.
+- ~6 DynamoDB tables, each with backup, capacity, and migration concerns.
+- ~5 SQS queues + 5 DLQs, each with retention and alarming.
+- An OpenSearch cluster (or Aurora read-replica) for ops queries.
+- An EventBridge Scheduler quota to manage.
+- A custom IdempotencyKeys table because at-least-once delivery means every
+  handler must dedupe on its own.
+- Hundreds of lines of "read row → CAS update → publish next message" glue
+  that is structurally identical across stages.
+- A documentation burden: the state machine is enforced by N independent
+  `ConditionExpression`s and is not visible anywhere as a single artefact.
+
+This design **does work**. Real banks run on systems like this. The cost
+isn't in any single component — each one is fine in isolation — it's in the
+choreography: every component has to know about the others, and changes
+ripple. Adding `DEBT_CONSOLIDATION` means touching the underwrite Lambda,
+the review-task fields, the SLA timer logic if debt has different SLAs, and
+the OpenSearch mapping.
+
+---
+
+## Appendix B. How that design translates to Temporal
+
+The Temporal implementation in §§1–11 isn't a different system; it's the
+same system with the choreography layer **collapsed into a single function
+call graph**. Component-by-component:
+
+| Conventional component | Temporal equivalent | What disappears |
+| --- | --- | --- |
+| `Applications` row + `version` column | Workflow event history + closure-scoped local variables (`state`, `submittedDocs`, `pendingHumanDecision`, `uwAttempt`) | OCC, version columns, the entire CAS dance |
+| SQS queues between stages (`validate-q`, `enrich-q`, `underwrite-q`, `fund-q`, …) | Sequential `await` calls inside `loanApplicationWorkflow` | Five queues, five DLQs, five visibility-timeout decisions |
+| `IdempotencyKeys` table | `workflowId = applicationId` + `workflowIdConflictPolicy: USE_EXISTING` | Dedupe table, message-ID tracking |
+| Conditional `UpdateItem` per transition | One `transition(status, detail)` helper that mutates the in-memory state and upserts a Search Attribute | ~10 hand-rolled state guards |
+| `EnrichJoin` Lambda + DynamoDB Streams + counter row | `Promise.all([credit.pull, identity.verify, fraud.screen])` with per-call `.catch(() => null)` | The entire fan-in mechanism |
+| Provider Lambdas + reserved concurrency for rate limit | One activity per provider routed to a per-provider task queue with `maxTaskQueueActivitiesPerSecond` | Tight coupling between scaling and rate limiting |
+| EventBridge Scheduler / Step Functions Wait / Sweeper Lambda for 48h SLA | `Promise.race([runPipeline(), wf.sleep(SLA_MS)])` | One-shot schedules, cleanup-on-terminal logic, the `SlaTimers` table |
+| EventBridge Scheduler for 24h doc-wait | `await wf.condition(predicate, DOC_WAIT_MS)` | Timer + predicate were two separate components; now one expression |
+| `ReviewTasks` table + `SubmitDecision` Lambda + CAS validation + race detection | `wf.defineUpdate<…>('submitHumanDecision')` with a validator + `await wf.condition(decided)` | The Lambda, the table-as-mailbox, the 409 translation logic |
+| DynamoDB Streams → `AuditWriter` Lambda → `AuditLog` table | The workflow's own event history (built-in) *plus* the `recordAudit` activity for the compliance store | The Streams glue; history is automatic, the activity is intentional |
+| OpenSearch projection for ops UI | `getState` Query + Search Attributes mirrored from `transition()` | The Streams pipeline, the index mappings, the eventual-consistency gap |
+| Step Functions Parallel inside the enrichment subgraph | Native `Promise.all` inside the workflow | The second orchestration model |
+| Workflow versioning when rules change | `wf.patched('rule-change')` + Worker Versioning, scoped per task queue | Blue/green Lambda alias gymnastics |
+
+### B.1 What collapses, concretely
+
+The conventional design needs eight Lambdas to express the linear pipeline:
+`StartApplication`, `Validate`, `EnrichCoordinator`, `PullCredit`,
+`VerifyIdentity`, `ScreenFraud`, `EnrichJoin`, `Underwrite`, `Disburse`,
+`NotifyApplicant`. Plus `SubmitDecision`, `SlaExpiry`, `AuditWriter`,
+`AggregatorFanOut`. Each Lambda is a strict-format `(read state → do work →
+CAS write → publish next)` shell.
+
+In Temporal that whole sequence is:
+
+```typescript
+await transition('VALIDATING');
+let validation = await validateApplication({ ...app, documents: submittedDocs });
+while (!validation.ok) { /* AWAITING_DOCUMENTS branch */ }
+await transition('ENRICHING');
+const enrichment = await enrich();                 // Promise.all under the hood
+await transition('UNDERWRITING');
+let result = await runUnderwriting(enrichment);    // child workflow per product
+if (result.decision === 'APPROVE') return await fund(result);
+if (result.decision === 'DECLINE') return await finishDeclined(result.reasons);
+const human = await awaitHumanDecision(result);    // wf.condition + Update
+```
+
+The state row, the queues, the CAS guards, the Streams join, the timer-table
+cleanup — all of those are *implied by the sequential control flow* and the
+durable execution model. The code is the state machine.
+
+### B.2 What's structurally different (not just simpler)
+
+A few things change in kind, not just degree:
+
+1. **Resume semantics are exact.** In the conventional design, "resume after
+   a crash" means a new Lambda picks up the SQS message and re-reads the
+   row. Local variables held between two writes are lost. In Temporal the
+   entire local scope — closures, in-flight `await`s, the position inside
+   `Promise.race` — is restored bit-identical from event history. There is
+   no `if (state == 'ENRICHING') resume_enrichment()` to write.
+
+2. **Idempotency moves from per-message to per-application.** SQS at-least-
+   once forces every handler to dedupe each individual message. Temporal
+   ensures each *activity* runs at-least-once but the workflow itself is
+   single-threaded and deterministic — so the dedupe burden collapses to
+   "use `applicationId` as the workflow ID and as the idempotency key on
+   the one activity that has external side effects (`disburseFunds`)."
+
+3. **The state machine is a single artefact.** In the AWS build, it lives
+   only as a constraint enforced by `ConditionExpression`s scattered across
+   ten Lambdas. In the Temporal build it's the function body of
+   `loanApplicationWorkflow` — readable top-to-bottom, version-controlled,
+   diffable, testable in `src/__tests__/workflow.test.ts`.
+
+4. **Human-in-the-loop stops being a coordination problem.** A reviewer's
+   decision is an Update to a running workflow; the validator runs
+   synchronously in the workflow's own execution context, so authority
+   checks and race conditions are enforced where the state lives. The
+   `ReviewTasks` table downgrades from "system of record for parked
+   applications" to "list-view convenience for ops" — and even that can be
+   replaced with a Search Attribute filter.
+
+5. **What you still own** vs. what Temporal owns: you still own the
+   business logic (the underwriting rules, the validation rules, the
+   provider clients, the data converter for PII, the document store). You
+   don't own the state durability, the timer service, the dedupe table, the
+   read model, the event log, the saga choreography, or the resume code.
+   Those *don't exist* in your codebase any more — they're operational
+   concerns handled by the Temporal cluster.
+
+### B.3 What Temporal costs you in return
+
+Honesty matters: you take on three things in exchange.
+
+1. **A cluster to run.** Either Temporal Cloud (SaaS — easiest, costs money,
+   data-residency questions) or self-hosted Temporal (Cassandra/Postgres +
+   Elasticsearch + the frontend/history/matching services). Compared to the
+   AWS-native version this replaces a *lot* of managed services with a
+   smaller number of managed services, but they're services you need to
+   know.
+
+2. **Determinism discipline.** Workflow code must be deterministic on replay.
+   The TS SDK overrides `Date.now()` and `Math.random()`, but you still
+   can't read the filesystem, can't call `process.env` from the workflow,
+   can't iterate a `Map` in insertion-order-sensitive ways across SDK
+   versions. The §13 trade-offs around `patched()` and Worker Versioning
+   are the price.
+
+3. **A different mental model.** Engineers used to event-driven AWS need to
+   relearn what "blocking for three days" means when it's a single `await`.
+   The win is enormous, but it's a learning curve, not a free upgrade.
+
+The verdict: for a workflow with **long waits**, **human steps**,
+**partial-failure fan-outs**, and **SLA timers**, Temporal collapses a
+double-digit number of operational components into a single durable function
+call. The AWS-native design works; the Temporal design moves the complexity
+out of your codebase and onto a cluster purpose-built to hold it.
+
+---
+
 See `README.md` to run the workers and the end-to-end demo locally.

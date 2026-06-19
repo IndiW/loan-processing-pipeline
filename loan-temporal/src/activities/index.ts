@@ -138,7 +138,7 @@ export async function recordAudit(event: AuditEvent): Promise<void> {
 export async function notifyApplicant(input: {
   applicationId: string;
   email: string;
-  template: 'MISSING_DOCS' | 'APPROVED' | 'DECLINED' | 'REMINDER';
+  template: 'MISSING_DOCS' | 'APPROVED' | 'DECLINED' | 'WITHDRAWN' | 'REMINDER';
   data?: Record<string, unknown>;
 }): Promise<void> {
   log.info('NOTIFY', input);
