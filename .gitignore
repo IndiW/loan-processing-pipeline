@@ -3,3 +3,4 @@ REQUIREMENTS.md
 npm_modules/
 .agents
 .claude
+.DS_Store

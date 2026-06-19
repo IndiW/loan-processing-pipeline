@@ -2,7 +2,7 @@
 
 A Temporal-orchestrated loan pipeline: ingest from 3 channels → validate →
 enrich (credit/identity/fraud) → product-isolated underwriting → human review
-when referred → fund. See **[ARCHITECTURE.md](./ARCHITECTURE.md)** for the design
+when referred → fund. See **[ARCHITECTURE.md](../ARCHITECTURE.md)** for the design
 write-up, diagrams, and trade-offs.
 
 Built and type-checked against `@temporalio/* 1.18.1` (TypeScript SDK).
