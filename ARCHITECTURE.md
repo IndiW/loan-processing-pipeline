@@ -11,6 +11,14 @@ operator visibility.
 
 **Each application is a single, long-running Temporal Workflow, keyed by `applicationId`.**
 
+Assumption: Channels don't have meaningfully different trust profiles or risk models (ie different considerations in their flows). We are assuming the channels don't diverge so much so that business decisions need to be made at the normalization step.
+
+Assumption: Aggregator delivers file with a batch of applications in some transport. We want to read a thousand row file and recover from crashes mid file. 
+
+Benefits: We write one normalizer adapter. State machine is simpler. New channels easily added with one normalizer function and ingestion adapter.
+
+Trade-offs: Adopt lossy normalization. We silently drop fields we aren't interested in. Possible schema bloat - would evenutally need a channelMetadata object
+
 That one decision buys most of the requirements for free:
 
 | Requirement from the brief | What Temporal gives you |
@@ -89,9 +97,32 @@ Why separate task queues per **product** and per **provider**? Two reasons:
    rate limit (`maxTaskQueueActivitiesPerSecond`) that matches the vendor's
    contractual RPS, regardless of how many worker pods are running.
 
+Temporal Cluster: Infra that makes durable execution work.
+- Frontend: Workers and clients connect here to start workflows
+- history: stores immutable event log
+- matching: the scheduler (like a event coordinator)
+
+Workers: 
+- provider workers called during ENRICHING and is called concurrently 
+- underwriter workers: different based on product type
+- orchestrator worker: runs the main workflow and dispatches activities and child workflows. Also resumes to handle underwriting decision
+- The orchestrator stays alive the entire 48 hour window
+
+`
+Orchestrator → [writes task to cluster] → Provider worker
+Provider worker → [writes result to cluster] → Orchestrator
+`
+
 ---
 
 ## 3. Application lifecycle as a state machine
+
+Business decision Assumption: 
+- 48H SLA window is the deadline
+- Alternative: Application continues and we just set a flag that says the SLA was missed. The SLA becomes a metric
+
+Pros: Deals with data staleness - certain third party checks have validity windows. 
+Cons: Expiry could happen if a vendor is down or the queue was backlogged which is bad UX and compliance. Solution: When a provider is missing we opt to REFER.
 
 ```mermaid
 stateDiagram-v2
@@ -119,6 +150,7 @@ stateDiagram-v2
         from any non-terminal state)
     end note
 ```
+The workflow is the state machine because you are either in one of the async workflow functions or you are in a blocking state. The whole thing has a 48h expiry wrapping the entire thing.
 
 Terminal states: **FUNDED, DECLINED, WITHDRAWN, EXPIRED**. The workflow can only
 return one `LoanOutcome`, so termination is structurally guaranteed.
@@ -153,6 +185,13 @@ For the batch channel specifically, a Temporal Schedule running a small
 through a 5,000-row file, the schedule's own durability and the per-row
 idempotency mean re-running is safe.
 
+Assumptions
+- batch files are most likely to be re-delivered in full which is why we focus on idempotency solution for that
+- if an aggregator reuses an ID for a different application, we'd use the old workflow instead of the new one
+- we aren't dealing with if aggregator sends wrong externalId. We should validate its uniqueness and format at the normalizer boundary
+- The fix would be checking the fingerprint of the application (fields like SSN, loan type etc) to compare two applications. We should also ensure aggregators guarantee externalId uniqueness at the contract level
+
+- For emails, we could use the messageId as the workflowID similar to how the aggregator uses externalId - that way we can catch duplicate emails
 ---
 
 ## 5. Workflow definition
@@ -206,6 +245,13 @@ Two activity details that matter in production:
   replay. Disbursement is the dangerous one and uses `applicationId` as the
   payment-rail idempotency key.
 
+
+How did we choose those numbers?
+- Disbursement is most consequential (ie approving someine without paying them) so we want to retry alot
+- whats the expected recovery time of the dependency
+- Whats the cost of giving up? For recordAudit, we may want to retry for hours or indefinitely with a DLQ escalation
+- whats the backoff curve? 
+
 ---
 
 ## 7. Third-party failures, rate limits, and partial failures
@@ -255,6 +301,8 @@ flowchart LR
     F -- clean --> AP[APPROVE]
 ```
 
+Assumption: We want humans in the loop for these decisions. Depending on the business requirements, this can just be a decline.
+
 ---
 
 ## 8. Human-in-the-loop: pause and resume seamlessly
@@ -285,6 +333,8 @@ sequenceDiagram
         WF->>WF: closeReviewTask, resume → FUNDING
     end
 ```
+> A Signal is a way of interacting with a running workflow. You fire and forget with no response. Used for things that don't need confirmation
+
 
 Why an **Update** rather than a **Signal** for the human decision:
 
@@ -422,6 +472,10 @@ ran, what each provider returned, and where it's waiting.
   **references**, never blobs. (The `LoanApplication` type carries `DocumentRef`
   URIs for exactly this reason.)
 
+## 11.2 Changes in Application fields
+- set all fields to optional by default
+- we only need to support the old schema for the lifetime of the longest inflight-window (ie we only need to use patched() for 48H)
+- can utilize channelMetadata for all channel specific fields
 ---
 
 ## 12. Scaling 8k → 50k applications/month
@@ -440,7 +494,7 @@ events stays small, so `continue-as-new` isn't needed here.
 
 ---
 
-## 13. Trade-offs (the interesting part)
+## 13. Trade-offs 
 
 1. **Child workflows per product vs. one workflow with a strategy switch.**
    Chosen: child workflows. Trade-off: more moving parts and inter-workflow
@@ -475,7 +529,7 @@ events stays small, so `continue-as-new` isn't needed here.
 
 6. **One workflow per application** is clear and debuggable but creates many
    workflow entities. At this volume that's a non-issue; I'm flagging it only
-   because it's the kind of thing that matters at 100× this scale.
+   because it's the kind of thing that matters at 100× this scale.At 100x theres heavy write pressure from all the upserts, we would need to think more about history retention periods, and cost. The alternative is batching which makes the SLA ambiguous, terminal states become complex (one app gets stuck in human review holds the entire batch), idempotency breaks, human review could stall the batch. For edge cases it ultimately just becomes the aggregator batch channel.
 
 7. **PII in history** demands an encryption codec from day one in a bank — easy
    to retrofit technically, painful to retrofit for compliance. I'd build it in
